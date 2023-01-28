@@ -11,7 +11,7 @@ const DecodeError = error{
     BadMapKeys,
 };
 
-pub const State = struct {
+const State = struct {
     env: ?*c.ErlNifEnv,
     stack: std.ArrayList(c.ERL_NIF_TERM),
     stream: std.json.TokenStream,
@@ -83,38 +83,32 @@ fn raiseDecodeError(env: ?*c.ErlNifEnv, err: DecodeError) c.ERL_NIF_TERM {
     return c.enif_raise_exception(env, c.enif_make_atom(env, name));
 }
 
-const StateResource = nif.Resource(State);
-pub var state_resource: StateResource = undefined;
-
-pub fn load(env: ?*c.ErlNifEnv) bool {
-    state_resource = StateResource.init(env, "JzonDecoderState", .{ .destroy = freeState }) catch {
-        std.log.debug("failed to register decode state resource type", .{});
-        return false;
-    };
-    return true;
-}
+const StateResource = nif.ResourceType(State);
+var state_resource: StateResource = undefined;
 
 fn freeState(env: ?*c.ErlNifEnv, state_ptr: ?*anyopaque) callconv(.C) void {
     _ = env;
     if (state_ptr) |ptr| {
         const state = @ptrCast(*State, @alignCast(@alignOf(State), ptr));
         state.deinit();
-    } else {
     }
 }
 
-pub fn decode(env: ?*c.ErlNifEnv, start: c.ErlNifTime, bin_term: c.ERL_NIF_TERM, state: *State) ?c.ERL_NIF_TERM {
-    _ = start;
-
+fn decode(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, count: *usize) ?c.ERL_NIF_TERM {
     std.log.debug("decode env: {x}", .{@ptrToInt(env.?)});
-    // var init_i = state.stream.i;
+    if (argc != 2) return c.enif_make_badarg(env);
+    if (c.enif_is_binary(env, argv[0]) == 0) return c.enif_make_badarg(env);
+    const state = state_resource.unwrap(env, argv[1]) orelse return c.enif_make_badarg(env);
+    const j = state.stream.i;
+
     while (state.next()) |result| {
         const token = result orelse break;
-        decodeToken(state, bin_term, token) catch |err| return raiseDecodeError(env, err);
-        //if (state.stream.i - init_i >= 1024) {
-            if (nif.shouldYield(env, start)) return null; // else std.log.debug("didn't yield, at offset {}", .{state.stream.i});
-            // init_i = state.stream.i;
-        //}
+        decodeToken(state, argv[0], token) catch |err| return raiseDecodeError(env, err);
+        const len = state.stream.i - j;
+        if (len >= count.*) {
+            count.* = len;
+            return null;
+        }
     } else |_| {
         // TODO: convert error union to atom
         return nif.raiseAtom(env, "badjson");
@@ -125,7 +119,7 @@ pub fn decode(env: ?*c.ErlNifEnv, start: c.ErlNifTime, bin_term: c.ERL_NIF_TERM,
     return term;
 }
 
-pub fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) DecodeError!void {
+fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) DecodeError!void {
     _ = bin_term;
     const stream = state.stream;
     const env = state.env;
@@ -191,4 +185,25 @@ pub fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Toke
                 error.BadMapKeys;
         },
     }
+}
+
+pub fn load(env: ?*c.ErlNifEnv) !void {
+    state_resource = StateResource.init(env, "JzonDecoderState", .{ .destroy = freeState }) catch |err| {
+        std.log.debug("failed to register decode state resource type", .{});
+        return err;
+    };
+}
+
+const MeteredDecode = nif.Metered("json_to_term", decode);
+
+pub fn start(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM) callconv (.C) c.ERL_NIF_TERM {
+    var bin: c.ErlNifBinary = undefined;
+    if (argc != 1) return c.enif_make_badarg(env);
+    if (c.enif_inspect_binary(env, argv[0], &bin) == 0) return c.enif_make_badarg(env);
+
+    const state = state_resource.alloc() orelse return nif.raiseAtom(env, "badalloc");
+    state.* = State.init(nif.allocator, nif.binarySlice(bin));
+    const state_term = c.enif_make_resource(env, state);
+    const argv1 = [_] c.ERL_NIF_TERM{ argv[0], state_term };
+    return MeteredDecode.start(env, 2, &argv1, 4*1024);
 }
