@@ -75,7 +75,7 @@ pub const ResourceOpts = struct {
 
 pub const ResourceError = error{ RegistrationFailed };
 
-pub fn Resource(comptime T: type) type {
+pub fn ResourceType(comptime T: type) type {
     return struct {
         resType: *c.ErlNifResourceType,
 
@@ -160,4 +160,68 @@ pub fn shouldYield(env: ?*c.ErlNifEnv, start: c.ErlNifTime) bool {
     var percent = @intCast(c_int, @divFloor(c.enif_monotonic_time(c.ERL_NIF_USEC) - start, 10000));
     percent = std.math.max(1, std.math.min(100, percent));
     return if (c.enif_consume_timeslice(env, percent) == 1) true else false;
+}
+
+const MeteredFun = fn (?*c.ErlNifEnv, c_int, [*c]const c.ERL_NIF_TERM, iter_size: *usize) ?c.ERL_NIF_TERM;
+
+pub fn Metered(comptime nif_name: []const u8, comptime wrapped_nif: MeteredFun) type {
+    return struct {
+        pub fn start(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, per_iter: c_ulong) c.ERL_NIF_TERM {
+            const new_argv = unshift(c.enif_make_ulong(env, per_iter), argc, argv)
+                orelse return raiseAtom(env, "badalloc");
+            defer c.enif_free(new_argv);
+            return run(env, argc + 1, new_argv);
+        }
+
+        pub fn run(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM) callconv(.C) c.ERL_NIF_TERM {
+            var delta: c_ulong = 0;
+            var delta_sum: c_ulong = 0;
+            var total: c_int = 0;
+            var percent: c_int = 0;
+
+            if (argc < 1) return c.enif_make_badarg(env);
+            if (c.enif_get_ulong(env, argv[0], &delta) == 0) return c.enif_make_badarg(env);
+            std.log.debug("delta: {}", .{delta});
+
+            while (true) {
+                const start_us = c.enif_monotonic_time(c.ERL_NIF_USEC);
+                if (wrapped_nif(env, argc - 1, argv + 1, &delta)) |term| {
+                    return term;
+                }
+                delta_sum += delta;
+
+                percent = @intCast(c_int, @divFloor((c.enif_monotonic_time(c.ERL_NIF_USEC) - start_us), 10));
+                total += percent;
+                if (percent < 1)
+                    percent = 1
+                else if (percent > 100)
+                    percent = 100;
+
+                if (c.enif_consume_timeslice(env, percent) == 1) break;
+            }
+
+            if (total > 100) {
+                const n = @divFloor(total, 100);
+                delta =
+                    if (n == 1) delta_sum - (delta_sum * (@intCast(c_ulong, total) - 100) / 100)
+                    else delta_sum / @intCast(c_ulong, n);
+            }
+            std.log.debug("yielding nif: delta={} percent={} total={}", .{delta, percent, total});
+
+            const new_argv = unshift(c.enif_make_ulong(env, delta), argc - 1, argv + 1)
+                orelse return raiseAtom(env, "badalloc");
+            defer c.enif_free(new_argv);
+            return c.enif_schedule_nif(env, nif_name.ptr, 0, @This().run, argc, new_argv);
+        }
+    };
+}
+
+fn unshift(head: c.ERL_NIF_TERM, argc: c_long, argv: [*c]const c.ERL_NIF_TERM) ?[*c]c.ERL_NIF_TERM {
+    const ptr = c.enif_alloc(@sizeOf(c.ERL_NIF_TERM) * (@intCast(usize, argc) + 1))
+        orelse return null;
+    var buf = @ptrCast([*]c.ERL_NIF_TERM, @alignCast(@alignOf(c.ERL_NIF_TERM), ptr));
+    var i: usize = 0;
+    while (i < argc) : (i += 1) buf[i+1] = argv[i];
+    buf[0] = head;
+    return buf;
 }
