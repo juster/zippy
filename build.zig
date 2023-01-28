@@ -7,7 +7,7 @@ pub fn build(b: *std.build.Builder) void {
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall.
     const mode = b.standardReleaseOptions();
 
-    const lib = b.addSharedLibrary("jzon", "zig_src/main.zig", SharedLibKind.unversioned);
+    const lib = b.addSharedLibrary("zippy", "zig_src/main.zig", SharedLibKind.unversioned);
     lib.addIncludePath("/Users/jrcd/opt/erl25/lib/erlang/erts-13.1.4/include");
     lib.setBuildMode(mode);
     lib.force_pic = true;
