@@ -162,7 +162,7 @@ pub fn shouldYield(env: ?*c.ErlNifEnv, start: c.ErlNifTime) bool {
     return if (c.enif_consume_timeslice(env, percent) == 1) true else false;
 }
 
-const MeteredFun = fn (?*c.ErlNifEnv, c_int, [*c]const c.ERL_NIF_TERM, iter_size: *usize) ?c.ERL_NIF_TERM;
+const MeteredFun = fn (?*c.ErlNifEnv, c_int, [*c]const c.ERL_NIF_TERM, iter_size: usize) ?c.ERL_NIF_TERM;
 
 pub fn Metered(comptime nif_name: []const u8, comptime wrapped_nif: MeteredFun) type {
     return struct {
@@ -185,7 +185,7 @@ pub fn Metered(comptime nif_name: []const u8, comptime wrapped_nif: MeteredFun) 
 
             while (true) {
                 const start_us = c.enif_monotonic_time(c.ERL_NIF_USEC);
-                if (wrapped_nif(env, argc - 1, argv + 1, &delta)) |term| {
+                if (wrapped_nif(env, argc - 1, argv + 1, delta)) |term| {
                     return term;
                 }
                 delta_sum += delta;

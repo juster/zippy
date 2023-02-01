@@ -138,22 +138,16 @@ fn freeState(env: ?*c.ErlNifEnv, state_ptr: ?*anyopaque) callconv(.C) void {
     }
 }
 
-fn decode(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, count: *usize) ?c.ERL_NIF_TERM {
+fn decode(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, count: usize) ?c.ERL_NIF_TERM {
     std.log.debug("decode env: {x}", .{@ptrToInt(env.?)});
     if (argc != 2) return c.enif_make_badarg(env);
     if (c.enif_is_binary(env, argv[0]) == 0) return c.enif_make_badarg(env);
     const state = state_resource.unwrap(env, argv[1]) orelse return c.enif_make_badarg(env);
-    const j = state.i;
 
-    state.limit(count.*);
+    state.limit(count);
     while (state.next()) |result| {
         const token = result orelse break;
         decodeToken(state, argv[0], token) catch |err| return raiseDecodeError(env, err);
-        const len = state.i - j;
-        if (len >= count.*) {
-            count.* = len;
-            return null;
-        }
     } else |_| {
         // TODO: convert error union to atom
         return nif.raiseAtom(env, "badjson");
