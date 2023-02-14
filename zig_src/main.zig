@@ -21,7 +21,7 @@ export fn nif_init() *c.ErlNifEntry {
     return nif.moduleEntry(comptime .{
         .name = "zippy",
         .funcs = &[_]c.ErlNifFunc{
-            nif.Func("json_to_term", decoder.start, 1),
+            nif.Func("json_to_term", decoder.exec, 1),
         },
         .load = load,
         .unload = unload

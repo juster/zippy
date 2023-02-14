@@ -162,18 +162,18 @@ pub fn shouldYield(env: ?*c.ErlNifEnv, start: c.ErlNifTime) bool {
     return if (c.enif_consume_timeslice(env, percent) == 1) true else false;
 }
 
-const MeteredFun = fn (?*c.ErlNifEnv, c_int, [*c]const c.ERL_NIF_TERM, iter_size: usize) ?c.ERL_NIF_TERM;
+const YieldingFun = fn (?*c.ErlNifEnv, c_int, [*c]const c.ERL_NIF_TERM, iter_size: usize) ?c.ERL_NIF_TERM;
 
-pub fn Metered(comptime nif_name: []const u8, comptime wrapped_nif: MeteredFun) type {
+pub fn Yielding(comptime nif_name: []const u8, comptime wrapped_nif: YieldingFun) type {
     return struct {
-        pub fn start(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, per_iter: c_ulong) c.ERL_NIF_TERM {
+        pub fn nif(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, per_iter: c_ulong) c.ERL_NIF_TERM {
             const new_argv = unshift(c.enif_make_ulong(env, per_iter), argc, argv)
                 orelse return raiseAtom(env, "badalloc");
             defer c.enif_free(new_argv);
             return run(env, argc + 1, new_argv);
         }
 
-        pub fn run(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM) callconv(.C) c.ERL_NIF_TERM {
+        fn run(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM) callconv(.C) c.ERL_NIF_TERM {
             var delta: c_ulong = 0;
             var delta_sum: c_ulong = 0;
             var total: c_int = 0;

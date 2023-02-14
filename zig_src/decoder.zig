@@ -11,71 +11,97 @@ const DecodeError = error{
     BadMapKeys,
 };
 
+// straight copy of std.json.TokenStream but with a chunk_size limit added
+pub const ChunkedTokenStream = struct {
+    const Token = std.json.Token;
+    const StreamingParser = std.json.StreamingParser;
+    const Self = @This();
+
+    i: usize,
+    slice: []const u8,
+    parser: StreamingParser,
+    token: ?Token,
+
+    pub const Error = StreamingParser.Error || error{UnexpectedEndOfJson};
+
+    pub const Streamed = union(enum) {
+        Token: std.json.Token,
+        EndOfChunk,
+        EndOfJson
+    };
+
+    pub fn init(slice: []const u8) Self {
+        return Self{
+            .i = 0,
+            .slice = slice,
+            .parser = StreamingParser.init(),
+            .token = null,
+        };
+    }
+
+    fn stackUsed(self: *Self) usize {
+        return self.parser.stack.len + if (self.token != null) @as(usize, 1) else 0;
+    }
+
+    pub fn next(self: *Self, n: usize) !Streamed {
+        if (self.token) |token| {
+            self.token = null;
+            return Streamed{.Token = token};
+        }
+
+        const len = std.math.min(self.slice.len, self.i + n);
+
+        var t1: ?Token = undefined;
+        var t2: ?Token = undefined;
+
+        while (self.i < len) {
+            try self.parser.feed(self.slice[self.i], &t1, &t2);
+            self.i += 1;
+
+            if (t1) |token| {
+                self.token = t2;
+                return Streamed{.Token = token};
+            }
+        }
+
+        // Without this a bare number fails, the streaming parser doesn't know the input ended
+        // (sic)
+        if (self.i >= self.slice.len) {
+            try self.parser.feed(' ', &t1, &t2);
+            self.i += 1;
+        }
+
+        if (t1) |token| {
+            return Streamed{.Token = token};
+        } else if (self.i >= self.slice.len) {
+            return if (self.parser.complete) .EndOfJson
+                else error.UnexpectedEndOfJson;
+        } else {
+            return .EndOfChunk;
+        }
+    }
+};
+
 const State = struct {
     env: ?*c.ErlNifEnv,
     stack: std.ArrayList(c.ERL_NIF_TERM),
     frame_size: usize = 0,
-    json: []const u8,
-    i: usize = 0,
-    chunk_size: usize,
-    parser: std.json.StreamingParser,
-    peek: ?Token,
+    stream: ChunkedTokenStream,
 
-    const StreamingParser = std.json.StreamingParser;
-    const Token = std.json.Token;
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, json: []const u8, chunk_size: usize) Self {
+    pub fn init(allocator: std.mem.Allocator, json: []const u8) Self {
         //var log_alloc = std.heap.loggingAllocator(allocator).allocator();
         std.log.debug("{s} init", .{@typeName(Self)});
         return Self{
             .env = c.enif_alloc_env(),
             .stack = std.ArrayList(c.ERL_NIF_TERM).init(allocator),
-            .json = json,
-            .peek = null,
-            .chunk_size = chunk_size,
-            .parser = StreamingParser.init(),
+            .stream = ChunkedTokenStream.init(json),
         };
     }
 
-    pub fn limit(self: *Self, n: usize) void {
-        self.chunk_size = n;
-    }
-
-    // straight copy of std.json.TokenStream but with a chunk_size limit added
-    pub fn next(self: *Self) !?std.json.Token {
-        if (self.peek) |token| {
-            self.peek = null;
-            return token;
-        }
-        var t1: ?Token = undefined;
-        var t2: ?Token = undefined;
-
-        const len = std.math.min(self.json.len, self.i + self.chunk_size);
-        while (self.i < len) {
-            try self.parser.feed(self.json[self.i], &t1, &t2);
-            self.i += 1;
-
-            if (t1) |token| {
-                self.peek = t2;
-                return token;
-            }
-        }
-
-        // Without this a bare number fails, the streaming parser doesn't know the input ended
-        try self.parser.feed(' ', &t1, &t2);
-        self.i += 1;
-
-        if (t1) |token| {
-            return token;
-        } else if (self.parser.complete) {
-            return null;
-        } else if (self.i == self.json.len) {
-            return error.UnexpectedEndOfJson;
-        } else {
-            // end of a chunk but not the end of the slice
-            return null;
-        }
+    pub fn next(self: *Self, n: usize) !ChunkedTokenStream.Streamed {
+        return self.stream.next(n);
     }
 
     pub fn push(self: *Self, term: c.ERL_NIF_TERM) !void {
@@ -141,15 +167,26 @@ fn freeState(env: ?*c.ErlNifEnv, state_ptr: ?*anyopaque) callconv(.C) void {
 fn decode(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, count: usize) ?c.ERL_NIF_TERM {
     std.log.debug("decode env: {x}", .{@ptrToInt(env.?)});
     if (argc != 2) return c.enif_make_badarg(env);
-    if (c.enif_is_binary(env, argv[0]) == 0) return c.enif_make_badarg(env);
     const state = state_resource.unwrap(env, argv[1]) orelse return c.enif_make_badarg(env);
+    if (c.enif_is_binary(env, argv[0]) == 0) {
+        c.enif_release_resource(state);
+        return c.enif_make_badarg(env);
+    }
 
-    state.limit(count);
-    while (state.next()) |result| {
-        const token = result orelse break;
-        decodeToken(state, argv[0], token) catch |err| return raiseDecodeError(env, err);
+    while (state.next(count)) |result| {
+        switch (result) {
+            .Token => |token| {
+                decodeToken(state, argv[0], token) catch |err| {
+                    c.enif_release_resource(state);
+                    return raiseDecodeError(env, err);
+                };
+            },
+            .EndOfChunk => return null,
+            .EndOfJson => break,
+        }
     } else |_| {
         // TODO: convert error union to atom
+        c.enif_release_resource(state);
         return nif.raiseAtom(env, "badjson");
     }
 
@@ -166,7 +203,7 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
         .False => try state.push(c.enif_make_atom(env, "false")),
         .Null => try state.push(c.enif_make_atom(env, "null")),
         .Number => |no| {
-            const slice = no.slice(state.json, state.i - 1);
+            const slice = no.slice(state.stream.slice, state.stream.i - 1);
             if (no.is_integer) {
                 if (std.fmt.parseInt(c_long, slice, 10)) |i| {
                     return try state.push(c.enif_make_long(env, i));
@@ -184,13 +221,13 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
         },
         .String => |str| {
             // TODO: decode escape sequences
-            // const slice = str.slice(state.json, state.i - 1);
+            // const slice = str.slice(state.stream.slice, state.stream.i - 1);
             // var term: c.ERL_NIF_TERM = undefined;
             // const buf = c.enif_make_new_binary(env, slice.len, &term) orelse return error.OutOfMemory;
             // var i: usize = 0;
             // while (i < slice.len) : (i += 1) buf[i] = slice[i];
             // TODO: make sub-binaries instead of copying bytes?
-            const term = c.enif_make_sub_binary(env, bin_term, state.i - str.count - 1, str.count);
+            const term = c.enif_make_sub_binary(env, bin_term, state.stream.i - str.count - 1, str.count);
             return try state.push(term);
         },
         .ArrayBegin => try state.enter(),
@@ -232,17 +269,17 @@ pub fn load(env: ?*c.ErlNifEnv) !void {
     };
 }
 
-const MeteredDecode = nif.Metered("json_to_term", decode);
+const YieldingDecode = nif.Yielding("json_to_term", decode);
 
-pub fn start(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM) callconv (.C) c.ERL_NIF_TERM {
+pub fn exec(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM) callconv (.C) c.ERL_NIF_TERM {
     var bin: c.ErlNifBinary = undefined;
     if (argc != 1) return c.enif_make_badarg(env);
     if (c.enif_inspect_binary(env, argv[0], &bin) == 0) return c.enif_make_badarg(env);
 
     const chunk_size = 4 * 1024;
     const state = state_resource.alloc() orelse return nif.raiseAtom(env, "badalloc");
-    state.* = State.init(nif.allocator, nif.binarySlice(bin), chunk_size);
+    state.* = State.init(nif.allocator, nif.binarySlice(bin));
     const state_term = c.enif_make_resource(env, state);
-    const argv1 = [_] c.ERL_NIF_TERM{ argv[0], state_term };
-    return MeteredDecode.start(env, 2, &argv1, chunk_size);
+    const argv1 = [_]c.ERL_NIF_TERM{ argv[0], state_term };
+    return YieldingDecode.nif(env, 2, &argv1, chunk_size);
 }
