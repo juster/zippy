@@ -9,6 +9,7 @@ const DecodeError = error{
     BadIntStr,
     BadFloatStr,
     BadMapKeys,
+    BadJson
 };
 
 // straight copy of std.json.TokenStream but with a chunk_size limit added
@@ -18,6 +19,7 @@ pub const ChunkedTokenStream = struct {
     const Self = @This();
 
     i: usize,
+    max: usize,
     slice: []const u8,
     parser: StreamingParser,
     token: ?Token,
@@ -33,6 +35,7 @@ pub const ChunkedTokenStream = struct {
     pub fn init(slice: []const u8) Self {
         return Self{
             .i = 0,
+            .max = slice.len,
             .slice = slice,
             .parser = StreamingParser.init(),
             .token = null,
@@ -43,18 +46,20 @@ pub const ChunkedTokenStream = struct {
         return self.parser.stack.len + if (self.token != null) @as(usize, 1) else 0;
     }
 
-    pub fn next(self: *Self, n: usize) !Streamed {
+    pub fn limit(self: *Self, n: usize) void {
+        self.max = std.math.min(self.slice.len, self.i + n);
+    }
+
+    pub fn next(self: *Self) !Streamed {
         if (self.token) |token| {
             self.token = null;
             return Streamed{.Token = token};
         }
 
-        const len = std.math.min(self.slice.len, self.i + n);
-
         var t1: ?Token = undefined;
         var t2: ?Token = undefined;
 
-        while (self.i < len) {
+        while (self.i < self.max) {
             try self.parser.feed(self.slice[self.i], &t1, &t2);
             self.i += 1;
 
@@ -87,21 +92,17 @@ const State = struct {
     stack: std.ArrayList(c.ERL_NIF_TERM),
     frame_size: usize = 0,
     stream: ChunkedTokenStream,
+    //arena_allocator: ArenaAllocator,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, json: []const u8) Self {
-        //var log_alloc = std.heap.loggingAllocator(allocator).allocator();
         std.log.debug("{s} init", .{@typeName(Self)});
         return Self{
             .env = c.enif_alloc_env(),
             .stack = std.ArrayList(c.ERL_NIF_TERM).init(allocator),
             .stream = ChunkedTokenStream.init(json),
         };
-    }
-
-    pub fn next(self: *Self, n: usize) !ChunkedTokenStream.Streamed {
-        return self.stream.next(n);
     }
 
     pub fn push(self: *Self, term: c.ERL_NIF_TERM) !void {
@@ -132,7 +133,10 @@ const State = struct {
 
     pub fn copyResult(self: *Self, env: ?*c.ErlNifEnv) c.ERL_NIF_TERM {
         assert(self.stack.items.len == 1);
-        return c.enif_make_copy(env, self.stack.items[0]);
+        const start = std.time.milliTimestamp();
+        var result = c.enif_make_copy(env, self.stack.items[0]);
+        std.log.debug("enif_make_copy took {} millis", .{std.time.milliTimestamp() - start});
+        return result;
     }
 
     pub fn deinit(self: *Self) void {
@@ -149,6 +153,7 @@ fn raiseDecodeError(env: ?*c.ErlNifEnv, err: DecodeError) c.ERL_NIF_TERM {
         error.BadIntStr => "badinteger",
         error.BadFloatStr => "badfloat",
         error.BadMapKeys => "badmap",
+        error.BadJson => "badjson",
     };
     return c.enif_raise_exception(env, c.enif_make_atom(env, name));
 }
@@ -165,38 +170,46 @@ fn freeState(env: ?*c.ErlNifEnv, state_ptr: ?*anyopaque) callconv(.C) void {
 }
 
 fn decode(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, count: usize) ?c.ERL_NIF_TERM {
-    std.log.debug("decode env: {x}", .{@ptrToInt(env.?)});
     if (argc != 2) return c.enif_make_badarg(env);
     const state = state_resource.unwrap(env, argv[1]) orelse return c.enif_make_badarg(env);
+
     if (c.enif_is_binary(env, argv[0]) == 0) {
         c.enif_release_resource(state);
         return c.enif_make_badarg(env);
     }
 
-    while (state.next(count)) |result| {
+    state.stream.limit(count);
+    if (decodeErr(state, argv[0])) |done| {
+        if (done) {
+            const term = state.copyResult(env);
+            c.enif_release_resource(state);
+            return term;
+        } else {
+            // keep state for next iteration
+            return null;
+        }
+    } else |err| {
+        c.enif_release_resource(state);
+        return raiseDecodeError(env, err);
+    }
+}
+
+fn decodeErr(state: *State, binary: c.ERL_NIF_TERM) DecodeError!bool {
+    while (state.stream.next()) |result| {
         switch (result) {
-            .Token => |token| {
-                decodeToken(state, argv[0], token) catch |err| {
-                    c.enif_release_resource(state);
-                    return raiseDecodeError(env, err);
-                };
-            },
-            .EndOfChunk => return null,
+            .Token => |token| try decodeToken(state, binary, token),
+            .EndOfChunk => return false,
             .EndOfJson => break,
         }
     } else |_| {
-        // TODO: convert error union to atom
-        c.enif_release_resource(state);
-        return nif.raiseAtom(env, "badjson");
+        // TODO: preserve specific errors
+        return error.BadJson;
     }
 
-    var term = state.copyResult(env);
-    c.enif_release_resource(state);
-    return term;
+    return true;
 }
 
 fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) DecodeError!void {
-    _ = bin_term;
     const env = state.env;
     switch (token) {
         .True => try state.push(c.enif_make_atom(env, "true")),
@@ -226,7 +239,6 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
             // const buf = c.enif_make_new_binary(env, slice.len, &term) orelse return error.OutOfMemory;
             // var i: usize = 0;
             // while (i < slice.len) : (i += 1) buf[i] = slice[i];
-            // TODO: make sub-binaries instead of copying bytes?
             const term = c.enif_make_sub_binary(env, bin_term, state.stream.i - str.count - 1, str.count);
             return try state.push(term);
         },
@@ -237,33 +249,37 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
             try state.leave();
             return try state.push(array);
         },
-        .ObjectBegin => try state.enter(),
+        .ObjectBegin => { std.log.debug("ObjectBegin", .{}); try state.enter(); },
         .ObjectEnd => {
+            std.log.debug("ObjectEnd", .{});
             const terms = state.frame();
             assert(terms.len % 2 == 0);
             const buf = c.enif_alloc(terms.len * @sizeOf(c.ERL_NIF_TERM)) orelse return error.OutOfMemory;
             defer c.enif_free(buf);
             const mterms = @ptrCast([*]c.ERL_NIF_TERM, @alignCast(@alignOf(c.ERL_NIF_TERM), buf));
-            const mid = terms.len / 2;
+            const count = terms.len / 2;
+            const keys = mterms[0..count];
+            const values = mterms[count..terms.len];
+            std.log.debug("terms.len:{} bufsize:{} count:{}", .{terms.len, terms.len * @sizeOf(c.ERL_NIF_TERM), count});
             var i: usize = 0;
-            while (i < mid) : (i += 1) {
-                mterms[i] = terms[2 * i];
-                mterms[mid + i] = terms[2 * i + 1];
+            while (i < count) : (i += 1) {
+                keys[i] = terms[2 * i];
+                values[i] = terms[2 * i + 1];
             }
             try state.leave();
 
             // TODO: allow (ignore) duplicate keys
             var map: c.ERL_NIF_TERM = undefined;
-            return if (c.enif_make_map_from_arrays(env, mterms, mterms + mid, mid, &map) == 1)
+            return if (c.enif_make_map_from_arrays(env, keys.ptr, values.ptr, count, &map) == 1)
                 try state.push(map)
             else
-                error.BadMapKeys;
+                return error.BadMapKeys;
         },
     }
 }
 
 pub fn load(env: ?*c.ErlNifEnv) !void {
-    state_resource = StateResource.init(env, "JzonDecoderState", .{ .destroy = freeState }) catch |err| {
+    state_resource = StateResource.init(env, "ZippyDecoderState", .{ .destroy = freeState }) catch |err| {
         std.log.debug("failed to register decode state resource type", .{});
         return err;
     };

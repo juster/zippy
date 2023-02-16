@@ -1,73 +1,51 @@
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const c = @import("./nif_c.zig");
 const assert = std.debug.assert;
+const mem = std.mem;
+const Allocator = mem.Allocator;
 
-pub var allocator = NifAllocator.allocator();
-
-const NifAllocator = struct {
-    pub const vtable = Allocator.VTable{
-        .alloc = alloc,
-        //.resize = resize,
-        .resize = Allocator.NoResize(anyopaque).noResize,
-        .free = free,
-    };
-
-    const Self = @This();
-    pub fn allocator() Allocator {
-        return Allocator{
-            .ptr = undefined,
-            .vtable = &vtable,
-        };
-    }
-
-    const MAX_ALIGN = @sizeOf(c_long);
-    fn alloc(ptr: *anyopaque, len: usize, ptr_align: u29, len_align: u29, ret_addr: usize) Allocator.Error![]u8 {
-        _ = ptr;
-        _ = len_align;
-        _ = ret_addr;
-
-        // TODO: alignment?
-        if (ptr_align > MAX_ALIGN) return error.OutOfMemory;
-        var full_len = std.math.max(len, ptr_align);
-        const pad = full_len % len_align;
-        if (pad > 0) full_len += pad;
-        //std.log.debug("alloc len={} full_len={} ptr_align={} len_align={} ret_addr={}", .{ len, full_len, ptr_align, len_align, ret_addr });
-
-        const any_ptr = c.enif_alloc(full_len) orelse return error.OutOfMemory;
-
-        std.debug.assert(std.mem.isAligned(@ptrToInt(any_ptr), ptr_align));
-        const buf = @ptrCast([*]u8, any_ptr);
-        return buf[0..len];
-    }
-
-    fn resize(ptr: *anyopaque, buf: []u8, buf_align: u29, new_size: usize, len_align: u29, ret_addr: usize) ?usize {
-        _ = ptr;
-        _ = buf_align;
-        _ = len_align;
-        _ = ret_addr;
-
-        //std.log.debug("resize buf={x} buf_align={} new_size={} len_align={} ret_addr={}", .{ @ptrToInt(buf.ptr), buf_align, new_size, len_align, ret_addr });
-
-        if (new_size == 0) {
-            c.enif_free(buf.ptr);
-            return 0;
-        }
-        if (new_size <= buf.len) {
-            return new_size;
-        }
-        return null;
-    }
-    fn free(ptr: *anyopaque, buf: []u8, buf_align: u29, ret_addr: usize) void {
-        _ = ptr;
-        _ = buf_align;
-        _ = ret_addr;
-
-        //std.log.debug("free buf={x} buf_align={} ret_addr={}", .{ @ptrToInt(buf.ptr), buf_align, ret_addr });
-        c.enif_free(buf.ptr);
-        return;
-    }
+pub const allocator = Allocator{
+    .ptr = undefined,
+    .vtable = &allocator_vtable,
 };
+
+const allocator_vtable = Allocator.VTable{
+    .alloc = alloc,
+    .resize = resize,
+    .free = free,
+};
+
+// Copy of std.heap.raw_c_allocator with modifications for the fact that memory
+// is aligned for ERL_NIF_TERMs.
+
+fn alloc(_: *anyopaque, len: usize, ptr_align: u29, len_align: u29, ret_addr: usize) Allocator.Error![]u8 {
+    _ = len_align;
+    _ = ret_addr;
+
+    std.log.debug("mem alloc: len={}", .{len});
+    assert(ptr_align <= @alignOf(c.ERL_NIF_TERM));
+    const any_ptr = c.enif_alloc(len) orelse return error.OutOfMemory;
+    const buf = @alignCast(@alignOf(c.ERL_NIF_TERM), @ptrCast([*]u8, any_ptr));
+    return buf[0..len];
+}
+
+fn resize(_: *anyopaque, buf: []u8, old_align: u29, new_len: usize, len_align: u29, ret_addr: usize) ?usize {
+    _ = old_align;
+    _ = ret_addr;
+
+    std.log.debug("mem resize: old_len={} new_len={}", .{buf.len, new_len});
+    if (new_len <= buf.len) {
+        return mem.alignAllocLen(buf.len, new_len, len_align);
+    }
+    return null;
+}
+fn free(_: *anyopaque, buf: []u8, old_align: u29, ret_addr: usize) void {
+    _ = old_align;
+    _ = ret_addr;
+
+    std.log.debug("mem free", .{});
+    c.enif_free(buf.ptr);
+}
 
 pub const ResourceOpts = struct {
     destroy: ?fn (?*c.ErlNifEnv, ?*anyopaque) callconv(.C) void = null,
@@ -166,11 +144,26 @@ const YieldingFun = fn (?*c.ErlNifEnv, c_int, [*c]const c.ERL_NIF_TERM, iter_siz
 
 pub fn Yielding(comptime nif_name: []const u8, comptime wrapped_nif: YieldingFun) type {
     return struct {
+        const Self = @This();
+        const Error = error.TooManyArguments;
+        const max_argc = 8;
+
+        fn unshift(head: c.ERL_NIF_TERM, argc: c_long, argv: [*c]const c.ERL_NIF_TERM, dest: [*]c.ERL_NIF_TERM) !void {
+            if (argc+1 > max_argc) return error.TooManyArguments;
+            var i: usize = 0;
+            dest[0] = head;
+            while (i < argc) : (i += 1) dest[i+1] = argv[i];
+            return;
+        }
+
         pub fn nif(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, per_iter: c_ulong) c.ERL_NIF_TERM {
-            const new_argv = unshift(c.enif_make_ulong(env, per_iter), argc, argv)
-                orelse return raiseAtom(env, "badalloc");
-            defer c.enif_free(new_argv);
-            return run(env, argc + 1, new_argv);
+            var new_argv: [max_argc]c.ERL_NIF_TERM = undefined;
+            unshift(c.enif_make_ulong(env, per_iter), argc, argv, &new_argv) catch |err| {
+                switch(err) {
+                    error.TooManyArguments => return raiseAtom(env, "argv_overflow"),
+                }
+            };
+            return run(env, argc + 1, &new_argv);
         }
 
         fn run(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM) callconv(.C) c.ERL_NIF_TERM {
@@ -181,7 +174,6 @@ pub fn Yielding(comptime nif_name: []const u8, comptime wrapped_nif: YieldingFun
 
             if (argc < 1) return c.enif_make_badarg(env);
             if (c.enif_get_ulong(env, argv[0], &delta) == 0) return c.enif_make_badarg(env);
-            std.log.debug("delta: {}", .{delta});
 
             while (true) {
                 const start_us = c.enif_monotonic_time(c.ERL_NIF_USEC);
@@ -201,27 +193,22 @@ pub fn Yielding(comptime nif_name: []const u8, comptime wrapped_nif: YieldingFun
             }
 
             if (total > 100) {
+                // adjust the chunk size if we exceeded the total time slice
                 const n = @divFloor(total, 100);
+                std.log.debug("yielding nif: n={} delta_sum={}", .{n, delta_sum});
                 delta =
                     if (n == 1) delta_sum - (delta_sum * (@intCast(c_ulong, total) - 100) / 100)
                     else delta_sum / @intCast(c_ulong, n);
             }
-            std.log.debug("yielding nif: delta={} percent={} total={}", .{delta, percent, total});
+            std.log.debug("yielding nif: delta={} delta_sum={} percent={} total={}", .{delta, delta_sum, percent, total});
 
-            const new_argv = unshift(c.enif_make_ulong(env, delta), argc - 1, argv + 1)
-                orelse return raiseAtom(env, "badalloc");
-            defer c.enif_free(new_argv);
-            return c.enif_schedule_nif(env, nif_name.ptr, 0, @This().run, argc, new_argv);
+            var new_argv: [max_argc]c.ERL_NIF_TERM = undefined;
+            unshift(c.enif_make_ulong(env, delta), argc - 1, argv + 1, &new_argv) catch |err| {
+                switch(err) {
+                    error.TooManyArguments => return raiseAtom(env, "overflow_argc"),
+                }
+            };
+            return c.enif_schedule_nif(env, nif_name.ptr, 0, @This().run, argc, &new_argv);
         }
     };
-}
-
-fn unshift(head: c.ERL_NIF_TERM, argc: c_long, argv: [*c]const c.ERL_NIF_TERM) ?[*c]c.ERL_NIF_TERM {
-    const ptr = c.enif_alloc(@sizeOf(c.ERL_NIF_TERM) * (@intCast(usize, argc) + 1))
-        orelse return null;
-    var buf = @ptrCast([*]c.ERL_NIF_TERM, @alignCast(@alignOf(c.ERL_NIF_TERM), ptr));
-    var i: usize = 0;
-    while (i < argc) : (i += 1) buf[i+1] = argv[i];
-    buf[0] = head;
-    return buf;
 }
