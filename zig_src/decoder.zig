@@ -9,7 +9,8 @@ const DecodeError = error{
     BadIntStr,
     BadFloatStr,
     BadMapKeys,
-    BadJson
+    BadJson,
+    BadAlloc
 };
 
 // straight copy of std.json.TokenStream but with a chunk_size limit added
@@ -92,14 +93,20 @@ const State = struct {
     stack: std.ArrayList(c.ERL_NIF_TERM),
     frame_size: usize = 0,
     stream: ChunkedTokenStream,
-    //arena_allocator: ArenaAllocator,
+    null_atom: c.ERL_NIF_TERM,
+    true_atom: c.ERL_NIF_TERM,
+    false_atom: c.ERL_NIF_TERM,
 
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, json: []const u8) Self {
         std.log.debug("{s} init", .{@typeName(Self)});
+        const env = c.enif_alloc_env();
         return Self{
-            .env = c.enif_alloc_env(),
+            .env = env,
+            .null_atom = c.enif_make_atom(env, "null"),
+            .true_atom = c.enif_make_atom(env, "true"),
+            .false_atom = c.enif_make_atom(env, "false"),
             .stack = std.ArrayList(c.ERL_NIF_TERM).init(allocator),
             .stream = ChunkedTokenStream.init(json),
         };
@@ -154,6 +161,7 @@ fn raiseDecodeError(env: ?*c.ErlNifEnv, err: DecodeError) c.ERL_NIF_TERM {
         error.BadFloatStr => "badfloat",
         error.BadMapKeys => "badmap",
         error.BadJson => "badjson",
+        error.BadAlloc => "badalloc",
     };
     return c.enif_raise_exception(env, c.enif_make_atom(env, name));
 }
@@ -194,10 +202,10 @@ fn decode(env: ?*c.ErlNifEnv, argc: c_int, argv: [*c]const c.ERL_NIF_TERM, count
     }
 }
 
-fn decodeErr(state: *State, binary: c.ERL_NIF_TERM) DecodeError!bool {
+fn decodeErr(state: *State, bin_term: c.ERL_NIF_TERM) DecodeError!bool {
     while (state.stream.next()) |result| {
         switch (result) {
-            .Token => |token| try decodeToken(state, binary, token),
+            .Token => |token| try decodeToken(state, bin_term, token),
             .EndOfChunk => return false,
             .EndOfJson => break,
         }
@@ -212,9 +220,9 @@ fn decodeErr(state: *State, binary: c.ERL_NIF_TERM) DecodeError!bool {
 fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) DecodeError!void {
     const env = state.env;
     switch (token) {
-        .True => try state.push(c.enif_make_atom(env, "true")),
-        .False => try state.push(c.enif_make_atom(env, "false")),
-        .Null => try state.push(c.enif_make_atom(env, "null")),
+        .True => try state.push(state.true_atom),
+        .False => try state.push(state.false_atom),
+        .Null => try state.push(state.null_atom),
         .Number => |no| {
             const slice = no.slice(state.stream.slice, state.stream.i - 1);
             if (no.is_integer) {
@@ -232,16 +240,7 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
                 }
             }
         },
-        .String => |str| {
-            // TODO: decode escape sequences
-            // const slice = str.slice(state.stream.slice, state.stream.i - 1);
-            // var term: c.ERL_NIF_TERM = undefined;
-            // const buf = c.enif_make_new_binary(env, slice.len, &term) orelse return error.OutOfMemory;
-            // var i: usize = 0;
-            // while (i < slice.len) : (i += 1) buf[i] = slice[i];
-            const term = c.enif_make_sub_binary(env, bin_term, state.stream.i - str.count - 1, str.count);
-            return try state.push(term);
-        },
+        .String => |str| try decodeString(state, bin_term, state.stream.i - str.count - 1, str),
         .ArrayBegin => try state.enter(),
         .ArrayEnd => {
             const terms = state.frame();
@@ -250,32 +249,92 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
             return try state.push(array);
         },
         .ObjectBegin => { std.log.debug("ObjectBegin", .{}); try state.enter(); },
-        .ObjectEnd => {
-            std.log.debug("ObjectEnd", .{});
-            const terms = state.frame();
-            assert(terms.len % 2 == 0);
-            const buf = c.enif_alloc(terms.len * @sizeOf(c.ERL_NIF_TERM)) orelse return error.OutOfMemory;
-            defer c.enif_free(buf);
-            const mterms = @ptrCast([*]c.ERL_NIF_TERM, @alignCast(@alignOf(c.ERL_NIF_TERM), buf));
-            const count = terms.len / 2;
-            const keys = mterms[0..count];
-            const values = mterms[count..terms.len];
-            std.log.debug("terms.len:{} bufsize:{} count:{}", .{terms.len, terms.len * @sizeOf(c.ERL_NIF_TERM), count});
-            var i: usize = 0;
-            while (i < count) : (i += 1) {
-                keys[i] = terms[2 * i];
-                values[i] = terms[2 * i + 1];
-            }
-            try state.leave();
-
-            // TODO: allow (ignore) duplicate keys
-            var map: c.ERL_NIF_TERM = undefined;
-            return if (c.enif_make_map_from_arrays(env, keys.ptr, values.ptr, count, &map) == 1)
-                try state.push(map)
-            else
-                return error.BadMapKeys;
-        },
+        .ObjectEnd => try decodeObject(state),
     }
+}
+
+fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: anytype) DecodeError!void {
+    switch (str.escapes) {
+        .None => {
+            const term = c.enif_make_sub_binary(state.env, bin_term, offset, str.count);
+            return try state.push(term);
+        },
+        // fall through
+        .Some => {}
+    }
+
+    const slice = state.stream.slice;
+    var new_bin_term: c.ERL_NIF_TERM = undefined;
+    //const new_len = str.decodedLength();
+    const new_len = str.count;
+    const new_bin = c.enif_make_new_binary(state.env, new_len, &new_bin_term)
+        orelse return error.BadAlloc;
+
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < str.count) {
+        assert(j < new_len);
+        if (slice[i] != '\\') {
+            new_bin[j] = slice[i];
+            i += 1;
+            j += 1;
+            continue;
+        }
+        if (slice[i+1] != 'u') {
+            new_bin[j] = switch (slice[i+1]) {
+                '\\' => '\\',
+                '/' => '/',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'f' => 12,
+                'b' => 8,
+                '"' => '"',
+                else => slice[i+1],
+            };
+            i += 2;
+            j += 1;
+            continue;
+        }
+        // TODO: unicode escaping looks rough https://www.rfc-editor.org/rfc/rfc7159
+        new_bin[j] = slice[i];
+        j += 1;
+        i += 1;
+    }
+    // XXX: temp hack. pad extra bytes with something.
+    while (j < new_len) {
+        new_bin[j] = '#';
+        j += 1;
+    }
+
+    try state.push(new_bin_term);
+}
+
+fn decodeObject(state: *State) DecodeError!void {
+    std.log.debug("ObjectEnd", .{});
+    const env = state.env;
+    const terms = state.frame();
+    assert(terms.len % 2 == 0);
+    const buf = c.enif_alloc(terms.len * @sizeOf(c.ERL_NIF_TERM)) orelse return error.OutOfMemory;
+    defer c.enif_free(buf);
+    const mterms = @ptrCast([*]c.ERL_NIF_TERM, @alignCast(@alignOf(c.ERL_NIF_TERM), buf));
+    const count = terms.len / 2;
+    const keys = mterms[0..count];
+    const values = mterms[count..terms.len];
+    std.log.debug("terms.len:{} bufsize:{} count:{}", .{terms.len, terms.len * @sizeOf(c.ERL_NIF_TERM), count});
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        keys[i] = terms[2 * i];
+        values[i] = terms[2 * i + 1];
+    }
+    try state.leave();
+
+    // TODO: allow (ignore) duplicate keys
+    var map: c.ERL_NIF_TERM = undefined;
+    return if (c.enif_make_map_from_arrays(env, keys.ptr, values.ptr, count, &map) == 1)
+        try state.push(map)
+    else
+        return error.BadMapKeys;
 }
 
 pub fn load(env: ?*c.ErlNifEnv) !void {
