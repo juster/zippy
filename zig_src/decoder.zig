@@ -310,6 +310,8 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
     try state.push(new_bin_term);
 }
 
+const TermSet = std.AutoHashMap(c.ERL_NIF_TERM, void);
+
 fn decodeObject(state: *State) DecodeError!void {
     std.log.debug("ObjectEnd", .{});
     const env = state.env;
@@ -323,7 +325,11 @@ fn decodeObject(state: *State) DecodeError!void {
     const values = mterms[count..terms.len];
     std.log.debug("terms.len:{} bufsize:{} count:{}", .{terms.len, terms.len * @sizeOf(c.ERL_NIF_TERM), count});
     var i: usize = 0;
+    var set = TermSet.init(nif.allocator);
+    defer set.deinit();
     while (i < count) : (i += 1) {
+        const result = set.getOrPut(terms[2 * i]) catch return error.BadAlloc;
+        if (result.found_existing) continue;
         keys[i] = terms[2 * i];
         values[i] = terms[2 * i + 1];
     }
