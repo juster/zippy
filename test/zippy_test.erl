@@ -15,6 +15,24 @@ str_esc_test() ->
 
 str_esc_u_test() ->
     ?assertEqual(
-        [<<16#FFFF/utf8>>],
-        zippy:json_to_term(<<"[\"\\uFFFF\"]">>)
+        <<0,16#FFFF/utf8>>,
+        zippy:json_to_term(<<"\"\\u0000\\uFFFF\"">>)
+    ).
+
+str_esc_u_solo_hi_surrogate_test() ->
+    ?assertError(
+        badunicode,
+        zippy:json_to_term(<<"\"\\uD800\"">>)
+    ).
+
+str_esc_u_solo_lo_surrogate_test() ->
+    ?assertError(
+        badunicode,
+        zippy:json_to_term(<<"\"\\uDC00\"">>)
+    ).
+
+str_esc_u_surrogate_pair_test() ->
+    ?assertEqual(
+        <<240,157,160,128>>,
+        zippy:json_to_term(<<"\"\\uD800\\uDC00\"">>)
     ).
