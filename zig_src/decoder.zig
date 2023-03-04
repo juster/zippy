@@ -8,7 +8,6 @@ const DecodeError = error{
     OutOfMemory,
     BadIntStr,
     BadFloatStr,
-    BadMapKeys,
     BadJson,
     BadAlloc
 };
@@ -159,7 +158,6 @@ fn raiseDecodeError(env: ?*c.ErlNifEnv, err: DecodeError) c.ERL_NIF_TERM {
         error.Overflow, error.OutOfMemory => "badalloc",
         error.BadIntStr => "badinteger",
         error.BadFloatStr => "badfloat",
-        error.BadMapKeys => "badmap",
         error.BadJson => "badjson",
         error.BadAlloc => "badalloc",
     };
@@ -310,37 +308,25 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
     try state.push(new_bin_term);
 }
 
-const TermSet = std.AutoHashMap(c.ERL_NIF_TERM, void);
-
 fn decodeObject(state: *State) DecodeError!void {
     std.log.debug("ObjectEnd", .{});
     const env = state.env;
     const terms = state.frame();
+    // JSON parser should prevent this
     assert(terms.len % 2 == 0);
-    const buf = c.enif_alloc(terms.len * @sizeOf(c.ERL_NIF_TERM)) orelse return error.OutOfMemory;
-    defer c.enif_free(buf);
-    const mterms = @ptrCast([*]c.ERL_NIF_TERM, @alignCast(@alignOf(c.ERL_NIF_TERM), buf));
-    const count = terms.len / 2;
-    const keys = mterms[0..count];
-    const values = mterms[count..terms.len];
-    std.log.debug("terms.len:{} bufsize:{} count:{}", .{terms.len, terms.len * @sizeOf(c.ERL_NIF_TERM), count});
+
+    var map: c.ERL_NIF_TERM = c.enif_make_new_map(env);
+    var unused: c.ERL_NIF_TERM = undefined;
     var i: usize = 0;
-    var set = TermSet.init(nif.allocator);
-    defer set.deinit();
-    while (i < count) : (i += 1) {
-        const result = set.getOrPut(terms[2 * i]) catch return error.BadAlloc;
-        if (result.found_existing) continue;
-        keys[i] = terms[2 * i];
-        values[i] = terms[2 * i + 1];
+    while (i < terms.len) : (i += 2) {
+        if (c.enif_get_map_value(env, map, terms[i], &unused) == 0) {
+            if (c.enif_make_map_put(env, map, terms[i], terms[i+1], &map) == 0) {
+                return error.BadAlloc;
+            }
+        }
     }
     try state.leave();
-
-    // TODO: allow (ignore) duplicate keys
-    var map: c.ERL_NIF_TERM = undefined;
-    return if (c.enif_make_map_from_arrays(env, keys.ptr, values.ptr, count, &map) == 1)
-        try state.push(map)
-    else
-        return error.BadMapKeys;
+    try state.push(map);
 }
 
 pub fn load(env: ?*c.ErlNifEnv) !void {
