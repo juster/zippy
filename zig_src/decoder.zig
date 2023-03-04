@@ -315,15 +315,21 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
 
         // If there is a second \uXXXX escape following this one, then this may be a UTF16 surrogate pair.
         const k = i+6;
-        if (k+2 > slice.len or (slice[k] != '\\' and slice[k+1] != 'u')) {
-            // there is no following \uXXXX escape
+        if (cp1 < 0xD800 or 0xDFFF < cp1) {
+            // this codepoint cannot be a surrogate pair
             i = k;
             j += try std.unicode.utf8Encode(@intCast(u21, cp1), new_slice[j .. new_len]);
             continue;
         }
 
-        // We must decode the second \uXXXX sequence before we can be sure.
-        assert(k+6 <= slice.len);
+        if (0xDC00 <= cp1 and cp1 <= 0xDFFF) {
+            // this is a lo surrogate pair and should not come first
+            return error.BadUnicode;
+        }
+        if (k+6 > slice.len or (slice[k] != '\\' and slice[k+1] != 'u')) {
+            // this codepoint can only be used as a surrogate but the second half is missing
+            return error.BadUnicode;
+        }
         const cp2 = std.fmt.parseUnsigned(u16, slice[k+2 .. k+6], 16) catch |err| {
             return switch(err){
                 error.InvalidCharacter => error.BadUnicode,
