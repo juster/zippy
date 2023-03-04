@@ -314,17 +314,17 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
 
         const k = i+6;
         if (cp1 < 0xD800 or 0xDFFF < cp1) {
-            // this codepoint cannot be a surrogate pair
+            // This codepoint cannot be part of a surrogate pair.
             i = k;
             j += try std.unicode.utf8Encode(@intCast(u21, cp1), new_slice[j .. new_len]);
             continue;
         }
         if (0xDC00 <= cp1 and cp1 <= 0xDFFF) {
-            // this is a low surrogate and should not come before a high surrogate
+            // This is a low surrogate and should not come before a high surrogate.
             return error.BadUnicode;
         }
         if (k+6 > slice.len or (slice[k] != '\\' and slice[k+1] != 'u')) {
-            // this codepoint can only be used as a surrogate but the second half is missing
+            // This codepoint can only be used as a surrogate but the second half is missing.
             return error.BadUnicode;
         }
 
@@ -336,8 +336,8 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
         };
         i = k+6;
 
-        if (0xDC00 < cp2 or cp2 > 0xDFFF) {
-            // this is supposed to be a low surrogate but is outside the range
+        if (cp2 < 0xDC00 or 0xDFFF < cp2) {
+            // This is supposed to be a low surrogate but is outside the range.
             return error.BadUnicode;
         }
 
