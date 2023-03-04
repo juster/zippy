@@ -304,7 +304,6 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
             j += 1;
             continue;
         }
-        // TODO: unicode escaping looks rough https://www.rfc-editor.org/rfc/rfc7159
         assert(i+6 <= slice.len);
         const cp1 = std.fmt.parseUnsigned(u16, slice[i+2 .. i+6], 16) catch |err| {
             return switch(err){
@@ -313,7 +312,6 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
             };
         };
 
-        // If there is a second \uXXXX escape following this one, then this may be a UTF16 surrogate pair.
         const k = i+6;
         if (cp1 < 0xD800 or 0xDFFF < cp1) {
             // this codepoint cannot be a surrogate pair
@@ -321,15 +319,15 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
             j += try std.unicode.utf8Encode(@intCast(u21, cp1), new_slice[j .. new_len]);
             continue;
         }
-
         if (0xDC00 <= cp1 and cp1 <= 0xDFFF) {
-            // this is a lo surrogate pair and should not come first
+            // this is a low surrogate and should not come before a high surrogate
             return error.BadUnicode;
         }
         if (k+6 > slice.len or (slice[k] != '\\' and slice[k+1] != 'u')) {
             // this codepoint can only be used as a surrogate but the second half is missing
             return error.BadUnicode;
         }
+
         const cp2 = std.fmt.parseUnsigned(u16, slice[k+2 .. k+6], 16) catch |err| {
             return switch(err){
                 error.InvalidCharacter => error.BadUnicode,
@@ -338,17 +336,17 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
         };
         i = k+6;
 
-        if (0xD800 <= cp1 and cp1 <= 0xDBFF and 0xDC00 <= cp2 and cp2 <= 0xDFFF) {
-            // This is indeed a surrogate pair.
-            // https://www.unicode.org/faq/utf_bom.html#utf16-3
-            const cp_x = (@intCast(u21, cp1) & ((1 << 6)-1) << 10) | (@intCast(u21, cp2) & ((1 << 10)-1));
-            const cp_w = (@intCast(u21, cp1) >> 6) & ((1 << 5) - 1);
-            const cp = ((cp_w + 1) << 16) | cp_x;
-            j += try std.unicode.utf8Encode(cp, new_slice[j .. new_len]);
-            continue;
+        if (0xDC00 < cp2 or cp2 > 0xDFFF) {
+            // this is supposed to be a low surrogate but is outside the range
+            return error.BadUnicode;
         }
-        j += try std.unicode.utf8Encode(@intCast(u21, cp1), new_slice[j .. new_len]);
-        j += try std.unicode.utf8Encode(@intCast(u21, cp2), new_slice[j .. new_len]);
+
+        // Yes, these two codepoints are officially a surrogate pair.
+        // https://www.unicode.org/faq/utf_bom.html#utf16-3
+        const cp_x = (@intCast(u21, cp1) & ((1 << 6)-1) << 10) | (@intCast(u21, cp2) & ((1 << 10)-1));
+        const cp_w = (@intCast(u21, cp1) >> 6) & ((1 << 5) - 1);
+        const cp = ((cp_w + 1) << 16) | cp_x;
+        j += try std.unicode.utf8Encode(cp, new_slice[j .. new_len]);
     }
 
     try state.push(new_bin_term);
