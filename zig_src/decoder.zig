@@ -8,6 +8,9 @@ const DecodeError = error{
     OutOfMemory,
     BadIntStr,
     BadFloatStr,
+    BadUnicode,
+    Utf8CannotEncodeSurrogateHalf,
+    CodepointTooLarge,
     BadJson,
     BadAlloc
 };
@@ -160,6 +163,9 @@ fn raiseDecodeError(env: ?*c.ErlNifEnv, err: DecodeError) c.ERL_NIF_TERM {
         error.BadFloatStr => "badfloat",
         error.BadJson => "badjson",
         error.BadAlloc => "badalloc",
+        error.BadUnicode,
+        error.Utf8CannotEncodeSurrogateHalf,
+        error.CodepointTooLarge => "badunicode",
     };
     return c.enif_raise_exception(env, c.enif_make_atom(env, name));
 }
@@ -238,7 +244,10 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
                 }
             }
         },
-        .String => |str| try decodeString(state, bin_term, state.stream.i - str.count - 1, str),
+        .String => |str| {
+            const offset = state.stream.i - str.count - 1;
+            try decodeString(state, bin_term, offset, str);
+        },
         .ArrayBegin => try state.enter(),
         .ArrayEnd => {
             const terms = state.frame();
@@ -261,30 +270,31 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
         .Some => {}
     }
 
-    const slice = state.stream.slice;
+    const slice = state.stream.slice[offset .. offset + str.count];
     var new_bin_term: c.ERL_NIF_TERM = undefined;
-    //const new_len = str.decodedLength();
-    const new_len = str.count;
+    const new_len = str.decodedLength();
+    //const new_len = str.count;
     const new_bin = c.enif_make_new_binary(state.env, new_len, &new_bin_term)
         orelse return error.BadAlloc;
+    const new_slice = new_bin[0 .. new_len];
 
     var i: usize = 0;
     var j: usize = 0;
     while (i < str.count) {
         assert(j < new_len);
         if (slice[i] != '\\') {
-            new_bin[j] = slice[i];
+            new_slice[j] = slice[i];
             i += 1;
             j += 1;
             continue;
         }
         if (slice[i+1] != 'u') {
-            new_bin[j] = switch (slice[i+1]) {
+            new_slice[j] = switch (slice[i+1]) {
                 '\\' => '\\',
                 '/' => '/',
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
+                'n' => 10,
+                'r' => 13,
+                't' => 9,
                 'f' => 12,
                 'b' => 8,
                 '"' => '"',
@@ -295,14 +305,44 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
             continue;
         }
         // TODO: unicode escaping looks rough https://www.rfc-editor.org/rfc/rfc7159
-        new_bin[j] = slice[i];
-        j += 1;
-        i += 1;
-    }
-    // XXX: temp hack. pad extra bytes with something.
-    while (j < new_len) {
-        new_bin[j] = '#';
-        j += 1;
+        assert(i+6 <= slice.len);
+        const cp1 = std.fmt.parseUnsigned(u16, slice[i+2 .. i+6], 16) catch |err| {
+            return switch(err){
+                error.InvalidCharacter => error.BadUnicode,
+                error.Overflow => unreachable
+            };
+        };
+
+        // If there is a second \uXXXX escape following this one, then this may be a UTF16 surrogate pair.
+        const k = i+6;
+        if (k+2 > slice.len or (slice[k] != '\\' and slice[k+1] != 'u')) {
+            // there is no following \uXXXX escape
+            i = k;
+            j += try std.unicode.utf8Encode(@intCast(u21, cp1), new_slice[j .. new_len]);
+            continue;
+        }
+
+        // We must decode the second \uXXXX sequence before we can be sure.
+        assert(k+6 <= slice.len);
+        const cp2 = std.fmt.parseUnsigned(u16, slice[k+2 .. k+6], 16) catch |err| {
+            return switch(err){
+                error.InvalidCharacter => error.BadUnicode,
+                error.Overflow => unreachable
+            };
+        };
+        i = k+6;
+
+        if (0xD800 <= cp1 and cp1 <= 0xDBFF and 0xDC00 <= cp2 and cp2 <= 0xDFFF) {
+            // This is indeed a surrogate pair.
+            // https://www.unicode.org/faq/utf_bom.html#utf16-3
+            const cp_x = (@intCast(u21, cp1) & ((1 << 6)-1) << 10) | (@intCast(u21, cp2) & ((1 << 10)-1));
+            const cp_w = (@intCast(u21, cp1) >> 6) & ((1 << 5) - 1);
+            const cp = ((cp_w + 1) << 16) | cp_x;
+            j += try std.unicode.utf8Encode(cp, new_slice[j .. new_len]);
+            continue;
+        }
+        j += try std.unicode.utf8Encode(@intCast(u21, cp1), new_slice[j .. new_len]);
+        j += try std.unicode.utf8Encode(@intCast(u21, cp2), new_slice[j .. new_len]);
     }
 
     try state.push(new_bin_term);
