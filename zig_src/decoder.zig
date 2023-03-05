@@ -360,14 +360,9 @@ fn decodeObject(state: *State) DecodeError!void {
     assert(terms.len % 2 == 0);
 
     var map: c.ERL_NIF_TERM = c.enif_make_new_map(env);
-    var unused: c.ERL_NIF_TERM = undefined;
     var i: usize = 0;
     while (i < terms.len) : (i += 2) {
-        if (c.enif_get_map_value(env, map, terms[i], &unused) == 0) {
-            if (c.enif_make_map_put(env, map, terms[i], terms[i+1], &map) == 0) {
-                return error.BadAlloc;
-            }
-        }
+        _ = c.enif_make_map_put(env, map, terms[i], terms[i+1], &map);
     }
     try state.leave();
     try state.push(map);
