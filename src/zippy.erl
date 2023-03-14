@@ -1,11 +1,11 @@
 -module(zippy).
 -export([json_to_term/1]).
 -nifs([json_to_term/1]).
--on_load(init/0).
+-on_load(load_nif/0).
 
-init() ->
+load_nif() ->
     Path = filename:join(priv_path(), "zippy"),
-    ok = erlang:load_nif(Path, 0).
+    erlang:load_nif(Path, 0).
 
 json_to_term(_) ->
     exit(nif_library_not_loaded).
