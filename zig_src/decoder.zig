@@ -230,18 +230,13 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
         .Number => |no| {
             const slice = no.slice(state.stream.slice, state.stream.i - 1);
             if (no.is_integer) {
-                if (std.fmt.parseInt(c_long, slice, 10)) |i| {
-                    return try state.push(c.enif_make_long(env, i));
-                } else |err| switch (err) {
-                    error.InvalidCharacter => return error.BadIntStr,
-                    error.Overflow => return error.Overflow,
-                }
+                const i = std.fmt.parseInt(c_long, slice, 10) catch return error.BadIntStr;
+                try state.push(c.enif_make_long(env, i));
+                return;
             } else {
-                if (std.fmt.parseFloat(f64, slice)) |f| {
-                    return try state.push(c.enif_make_double(env, f));
-                } else |err| switch (err) {
-                    error.InvalidCharacter => return error.BadFloatStr,
-                }
+                const f = std.fmt.parseFloat(f64, slice) catch return error.BadFloatStr;
+                try state.push(c.enif_make_double(env, f));
+                return;
             }
         },
         .String => |str| {
@@ -255,7 +250,7 @@ fn decodeToken(state: *State, bin_term: c.ERL_NIF_TERM, token: std.json.Token) D
             try state.leave();
             return try state.push(array);
         },
-        .ObjectBegin => { std.log.debug("ObjectBegin", .{}); try state.enter(); },
+        .ObjectBegin => try state.enter(),
         .ObjectEnd => try decodeObject(state),
     }
 }
@@ -267,7 +262,10 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
             return try state.push(term);
         },
         // fall through
-        .Some => {}
+        .Some => {
+            const term = c.enif_make_sub_binary(state.env, bin_term, offset, str.count);
+            return try state.push(term);
+        }
     }
 
     const slice = state.stream.slice[offset .. offset + str.count];
@@ -308,7 +306,8 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
         const cp1 = std.fmt.parseUnsigned(u16, slice[i+2 .. i+6], 16) catch |err| {
             return switch(err){
                 error.InvalidCharacter => error.BadUnicode,
-                error.Overflow => unreachable
+                // Overflow should never happen if str.decodedLength() is correct
+                error.Overflow => error.BadUnicode,
             };
         };
 
@@ -353,7 +352,6 @@ fn decodeString(state: *State, bin_term: c.ERL_NIF_TERM, offset: usize, str: any
 }
 
 fn decodeObject(state: *State) DecodeError!void {
-    std.log.debug("ObjectEnd", .{});
     const env = state.env;
     const terms = state.frame();
     // JSON parser should prevent this
