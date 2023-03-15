@@ -1,5 +1,6 @@
 -module(bench).
 -compile(export_all).
+-define(WARMUP_ROUNDS, 4).
 
 start(Filename) ->
     SansExt = filename:rootname(Filename),
@@ -8,7 +9,7 @@ start(Filename) ->
     %io:fwrite(File, "~p.~n", [zippy:json_to_term(JsonBin)]),
     %file:close(File),
     %sane(JsonBin),
-    meanbench(JsonBin).
+    meanbench(SansExt, JsonBin).
 
 sane(JsonBin) ->
     Term1 = jiffy:decode(JsonBin, [return_maps]),
@@ -73,35 +74,75 @@ typeof(X) when is_tuple(X) -> tuple;
 typeof(X) when is_list(X) -> list;
 typeof(X) when is_map(X) -> map.
 
-spawnbench(JsonBin) ->
+meanbench(Name, JsonBin) ->
+    Jiffy = bench(timer:seconds(10), 1, 16, fun() -> jiffy:decode(JsonBin), ok end),
+    io:format("~s: jiffy: ~p~n", [Name, Jiffy]),
+    Zippy = bench(timer:seconds(10), 1, 16, fun() -> zippy:json_to_term(JsonBin), ok end),
+    io:format("~s: zippy: ~p~n", [Name, Zippy]).
+
+bench(WaitMs, N, M, Fun) ->
     Self = self(),
-    lists:foreach(
-        fun(_) ->
-             spawn_link(fun() ->
-                 io:format("~p~n", [meanbench1(3, fun() ->
-                     _ = jiffy:decode(JsonBin)
-                 end)]),
-                 Self ! done
-             end),
-             receive done -> ok end
+    CollectPid = proc_lib:spawn_link(fun() -> collector(N) end),
+    register(collector, CollectPid),
+    % warmup
+    [_ = Fun() || _ <- lists:seq(1, ?WARMUP_ROUNDS)],
+    Pid = spawn_link(fun() -> bench_sup(N, M, Fun) end),
+    timer:sleep(WaitMs),
+    unlink(Pid),
+    exit(Pid, kill),
+    CollectPid ! {collect, Self},
+    receive {benches, Runs} -> Runs end.
+
+bench_sup(N, M, Fun) ->
+    process_flag(trap_exit, true),
+    [spawn_link(fun() -> runner(N, Fun) end) || _ <- lists:seq(1, M)],
+    bench_sup1(N, Fun).
+
+bench_sup1(N, Fun) ->
+    receive
+        {'EXIT', _Pid, normal} ->
+            proc_lib:spawn_link(fun() -> runner(N, Fun) end),
+            bench_sup1(N, Fun);
+        {'EXIT', _Pid, Reason} ->
+            io:format("DBG: Reason: ~p~n", [Reason]),
+            exit(Reason)
+    end.
+
+runner(N, Fun) ->
+    Times = [element(1, timer:tc(Fun)) || _ <- lists:seq(1, N)],
+    Mean = trunc(lists:sum(Times) / length(Times)),
+    collector ! {bench, [Mean | run_stats()]},
+    ok.
+
+run_stats() ->
+    [element(2, process_info(self(), K)) || K <- [memory, total_heap_size]].
+
+collector(N) ->
+    collector(N, []).
+
+collector(N, L1) ->
+    receive
+        {bench, L2} ->
+            collector(N, [L2 | L1]);
+        {collect, Pid} ->
+            Pid ! {benches, collector1(N, L1)}
+    end.
+
+collector1(_, []) -> [];
+collector1(N, Runs) ->
+    Sums = lists:foldl(
+        fun(L, Sum) ->
+            mapn(L, Sum, fun(X, Y) -> X + Y end)
         end,
-        lists:seq(1, 10)
-    ).
+        hd(Runs),
+        tl(Runs)
+    ),
+    %io:format("DBG: Sums=~p~n", [Sums]),
+    Counts = lists:duplicate(length(Sums), length(Runs)),
+    [X | L] = mapn(Sums, Counts, fun(X, C) -> X / C end),
+    [trunc(X / N) | L].
 
-meanbench(JsonBin) ->
-    Jiffy = meanbench1(1, fun() -> _ = jiffy:decode(JsonBin), ok end),
-    io:format("jiffy: ~p~n", [Jiffy]),
-    Zippy = meanbench1(1, fun() -> zippy:json_to_term(JsonBin), ok end),
-    io:format("zippy: ~p~n", [Zippy]).
-
-meanbench1(N, Fun) ->
-    Self = self(),
-    spawn_link(fun () ->
-        Times = [element(1, timer:tc(Fun)) || _ <- lists:seq(1, N)],
-        Mean = trunc(lists:sum(Times) / length(Times)),
-        Self ! {done, {Mean, self_info()}}
-    end),
-    receive {done, Result} -> Result end.
-
-self_info() ->
-    process_info(self(), [memory, total_heap_size]).
+mapn([], [], _Fun) ->
+    [];
+mapn([X | L1], [Y | L2], Fun) ->
+    [Fun(X, Y) | mapn(L1, L2, Fun)].
